@@ -19,6 +19,16 @@ const BRIDGE_PACKAGE_NAME = "@dsh-external/dsh-clawd-bridge";
 const WEB_PROFILE_NAME = "web";
 const DESKTOP_PROFILE_NAME = "desktop";
 const DSH_PROFILE_NAMES = Object.freeze([WEB_PROFILE_NAME, DESKTOP_PROFILE_NAME]);
+
+function physicalFileSystem() {
+  try {
+    // Electron's patched fs caches ASAR archives and keeps a handle open. The
+    // physical probe must use original-fs so an updater can replace app.asar.
+    return require("original-fs");
+  } catch {
+    return fs;
+  }
+}
 // Per-profile inspection latch. Each profile's latch only fences its own
 // startup sync, so a web and a desktop latch must never share a file.
 const INSPECTION_LATCH_FILE = "inspection-required.json";
@@ -1807,14 +1817,11 @@ function verifyWindowsDesktopRoot(root, options = {}) {
     try { stat = fsImpl.statSync(filePath); } catch {}
     if (!stat || !stat.isFile()) return false;
   }
-  // electron's patched fs reports an .asar bundle as a directory, while a plain
-  // Node process reports it as a file, so only "exists" is portable across both.
-  // (The bundled launcher target lives inside it, so a missing app.asar still
-  // fails the root.) Requiring isFile() here made Electron-based Clawd reject
-  // every real desktop install.
+  // Use the physical filesystem for this one probe. Electron's patched fs
+  // caches ASAR archives and keeps a handle open, blocking self-update.
   const asarPath = path.win32.join(root, "resources", "app.asar");
   let asarStat = null;
-  try { asarStat = fsImpl.statSync(asarPath); } catch {}
+  try { asarStat = (options.fs ? fsImpl : physicalFileSystem()).statSync(asarPath); } catch {}
   return !!asarStat;
 }
 
