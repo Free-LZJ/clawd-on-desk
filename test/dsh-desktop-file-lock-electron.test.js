@@ -10,22 +10,7 @@ const { once } = require("node:events");
 const { createInterface } = require("node:readline");
 const { DSH_CMD_TEMPLATE } = require("./dsh-desktop-fixtures");
 
-const discoveryScript = `
-const { discoverDshDesktopSync } = require(process.env.CLAWD_DSH_INSTALLER);
-const options = {
-  platform: "win32",
-  env: {},
-  windowsRegistrySnapshot: {
-    uninstall: [{ installLocation: process.env.CLAWD_DSH_APP_ROOT }],
-    commandDirectory: null,
-  },
-};
-function reportDiscovery() {
-  console.log(discoverDshDesktopSync(options).status);
-}
-process.stdin.on("data", reportDiscovery);
-reportDiscovery();
-`;
+const discoveryFixture = path.join(__dirname, "fixtures", "dsh-desktop-discovery.js");
 
 test("Windows desktop discovery leaves the ASAR replaceable while Node and Electron stay alive", {
   skip: process.platform !== "win32",
@@ -49,18 +34,37 @@ test("Windows desktop discovery leaves the ASAR replaceable while Node and Elect
   await require("@electron/asar").createPackage(sourceDir, sourceArchive);
   const archive = path.join(appRoot, "resources", "app.asar");
 
-  for (const [name, executable] of [["Node", process.execPath], ["Electron", require("electron")]]) {
+  // "injected" is the detector's shape: fs: require("fs"). Under Electron that
+  // is the patched fs, so the probe must still reach the physical filesystem.
+  // Electron runs as a real main process, never --run-as-node: the patched fs
+  // that retains the archive handle is the one it installs in that mode.
+  const childEnv = {
+    ...process.env,
+    CLAWD_DSH_INSTALLER: path.resolve(__dirname, "../hooks/dsh-install.js"),
+    CLAWD_DSH_APP_ROOT: appRoot,
+  };
+  delete childEnv.ELECTRON_RUN_AS_NODE;
+  const triggerFile = path.join(root, "recheck");
+  const recheck = () => fs.writeFileSync(triggerFile, String(Date.now()));
+  for (const [name, executable, injectDefaultFs] of [
+    ["Node (default fs)", process.execPath, false],
+    ["Node (injected fs)", process.execPath, true],
+    ["Electron main (default fs)", require("electron"), false],
+    ["Electron main (injected fs)", require("electron"), true],
+  ]) {
     await t.test(name, async (t) => {
       fs.copyFileSync(sourceArchive, archive);
-      const child = spawn(executable, ["-e", discoveryScript], {
+      const child = spawn(executable, [
+        discoveryFixture,
+        `--user-data-dir=${path.join(root, "electron-user-data")}`,
+      ], {
         env: {
-          ...process.env,
-          ELECTRON_RUN_AS_NODE: "1",
-          CLAWD_DSH_INSTALLER: path.resolve(__dirname, "../hooks/dsh-install.js"),
-          CLAWD_DSH_APP_ROOT: appRoot,
+          ...childEnv,
+          CLAWD_DSH_RECHECK_FILE: triggerFile,
+          ...(injectDefaultFs ? { CLAWD_DSH_INJECT_DEFAULT_FS: "1" } : {}),
         },
         windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: ["ignore", "pipe", "pipe"],
       });
       const exited = new Promise((resolve) => {
         child.once("exit", resolve);
@@ -75,10 +79,13 @@ test("Windows desktop discovery leaves the ASAR replaceable while Node and Elect
         lines.close();
       });
       const nextStatus = async () => {
-        const [line] = await once(lines, "line", { signal: AbortSignal.timeout(10_000) });
-        assert.equal(child.exitCode, null, stderr);
-        assert.equal(child.signalCode, null, stderr);
-        return line;
+        for (;;) {
+          const [line] = await once(lines, "line", { signal: AbortSignal.timeout(10_000) });
+          assert.equal(child.exitCode, null, stderr);
+          assert.equal(child.signalCode, null, stderr);
+          // A real Electron main process opens with a blank stdout line.
+          if (line.trim()) return line.trim();
+        }
       };
       assert.equal(await nextStatus(), "found", stderr);
 
@@ -87,12 +94,12 @@ test("Windows desktop discovery leaves the ASAR replaceable while Node and Elect
       fs.copyFileSync(sourceArchive, archive);
       fs.unlinkSync(previous);
       const rediscovered = nextStatus();
-      child.stdin.write("recheck\n");
+      recheck();
       assert.equal(await rediscovered, "found", stderr);
 
       fs.unlinkSync(archive);
       const missing = nextStatus();
-      child.stdin.write("recheck\n");
+      recheck();
       assert.equal(await missing, "not-found", stderr);
     });
   }

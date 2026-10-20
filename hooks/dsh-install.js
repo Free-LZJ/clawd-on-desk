@@ -1818,10 +1818,15 @@ function verifyWindowsDesktopRoot(root, options = {}) {
     if (!stat || !stat.isFile()) return false;
   }
   // Use the physical filesystem for this one probe. Electron's patched fs
-  // caches ASAR archives and keeps a handle open, blocking self-update.
+  // caches ASAR archives and keeps a handle open, blocking self-update. Only a
+  // real injection overrides that: the detector hands over
+  // `fs: options.fs || require("fs")`, and require("fs") is a singleton, so
+  // the default module means "nothing was injected". Existence is all this can
+  // assert: Electron reports app.asar as a directory, plain Node as a file.
   const asarPath = path.win32.join(root, "resources", "app.asar");
+  const probeFs = !options.fs || options.fs === fs ? physicalFileSystem() : options.fs;
   let asarStat = null;
-  try { asarStat = (options.fs ? fsImpl : physicalFileSystem()).statSync(asarPath); } catch {}
+  try { asarStat = probeFs.statSync(asarPath); } catch {}
   return !!asarStat;
 }
 
