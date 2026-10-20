@@ -16,6 +16,11 @@ test("Windows desktop discovery leaves the ASAR replaceable while Node and Elect
   skip: process.platform !== "win32",
   timeout: 30_000,
 }, async (t) => {
+  // Electron is an optional dependency and CI installs it conditionally, so
+  // spawn() against a missing binary would fail with an unhelpful ENOENT.
+  let electronExecutable;
+  try { electronExecutable = require("electron"); } catch { /* Optional dependency. */ }
+  if (typeof electronExecutable !== "string") return t.skip("Electron executable is not installed");
   const tempRoot = path.resolve(os.tmpdir());
   const root = fs.mkdtempSync(path.join(tempRoot, "clawd-dsh-file-lock-"));
   t.after(() => {
@@ -49,8 +54,8 @@ test("Windows desktop discovery leaves the ASAR replaceable while Node and Elect
   for (const [name, executable, injectDefaultFs] of [
     ["Node (default fs)", process.execPath, false],
     ["Node (injected fs)", process.execPath, true],
-    ["Electron main (default fs)", require("electron"), false],
-    ["Electron main (injected fs)", require("electron"), true],
+    ["Electron main (default fs)", electronExecutable, false],
+    ["Electron main (injected fs)", electronExecutable, true],
   ]) {
     await t.test(name, async (t) => {
       fs.copyFileSync(sourceArchive, archive);
@@ -67,8 +72,8 @@ test("Windows desktop discovery leaves the ASAR replaceable while Node and Elect
         stdio: ["ignore", "pipe", "pipe"],
       });
       const exited = new Promise((resolve) => {
-        child.once("exit", resolve);
-        child.once("error", resolve);
+        child.once("exit", (code, signal) => resolve(`code=${code}, signal=${signal}`));
+        child.once("error", (error) => resolve(error.message));
       });
       let stderr = "";
       child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
@@ -78,9 +83,19 @@ test("Windows desktop discovery leaves the ASAR replaceable while Node and Elect
         await exited;
         lines.close();
       });
+      // A status line is the only signal this test gets, so a child that dies
+      // must fail here and now. `once` neither resolves nor rejects when stdout
+      // ends: the wait just hangs until the AbortSignal fires, and the run
+      // reports a bare AbortError at the `t.test` line instead of naming the
+      // dead process. Racing the child's exit keeps that failure attributable.
       const nextStatus = async () => {
         for (;;) {
-          const [line] = await once(lines, "line", { signal: AbortSignal.timeout(10_000) });
+          const [line] = await Promise.race([
+            once(lines, "line", { signal: AbortSignal.timeout(10_000) }),
+            exited.then((how) => {
+              throw new Error(`${name} exited (${how}) before reporting status: ${stderr}`);
+            }),
+          ]);
           assert.equal(child.exitCode, null, stderr);
           assert.equal(child.signalCode, null, stderr);
           // A real Electron main process opens with a blank stdout line.
